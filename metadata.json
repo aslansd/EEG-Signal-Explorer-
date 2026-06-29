@@ -1,0 +1,6 @@
+{
+  "name": "EEG Signal Explorer",
+  "description": "An interactive notebook-style workspace for EEG signal visualization, preprocessing, feature extraction, and ML-assisted analysis with an AI clinical interpreter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
