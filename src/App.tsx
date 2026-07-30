@@ -1,759 +1,840 @@
-import React, { useState, useEffect } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  EEG_SCENARIOS,
-  generateEegData,
-} from "./data/presets";
+  AlertTriangle,
+  Activity,
+  BookOpen,
+  Brain,
+  Download,
+  Eye,
+  Heart,
+  Layers,
+  Play,
+  RefreshCw,
+  Upload,
+  Zap,
+} from "lucide-react";
+import { EEG_SCENARIOS } from "./data/presets";
+import { runPipeline } from "./lib/pipeline";
+import { simulateRecording } from "./lib/simulate";
 import {
-  EegScenarioId,
-  PreprocessingConfig,
-  ArtifactRemovalConfig,
-  FeatureExtractionConfig,
-  PredictionConfig,
-  NotebookCell,
-  EegAnalysisResult,
-  SpectralBandPower,
-} from "./types";
+  exportBandPowerCsv,
+  exportCleanedCsv,
+  exportRunReport,
+  parseDelimitedText,
+} from "./lib/io";
+import AICopilot from "./components/AICopilot";
+import NotebookCell from "./components/NotebookCell";
+import PredictionTimeline from "./components/PredictionTimeline";
 import ScalpMap from "./components/ScalpMap";
 import SignalExplorer from "./components/SignalExplorer";
 import SpectralCharts from "./components/SpectralCharts";
 import Spectrogram from "./components/Spectrogram";
-import NotebookCellComponent from "./components/NotebookCell";
-import AICopilot from "./components/AICopilot";
-import {
-  Brain,
-  Layers,
-  Upload,
-  Cpu,
-  RefreshCw,
-  Heart,
-  Eye,
-  AlertTriangle,
-  Zap,
-  BookOpen,
-} from "lucide-react";
+import type {
+  BandName,
+  CellId,
+  CellStatus,
+  EegRecording,
+  EegScenarioId,
+  PipelineConfig,
+} from "./types";
 
-export default function App() {
-  // 1. Pipeline Config States
-  const [activeScenarioId, setActiveScenarioId] = useState<EegScenarioId>("sleep");
-  
-  const [preprocessing, setPreprocessing] = useState<PreprocessingConfig>({
+const DEFAULT_CONFIG: PipelineConfig = {
+  preprocessing: {
     notchFilter: true,
     notchFrequency: 50,
+    notchQ: 30,
     bandpassEnabled: true,
     bandpassMin: 0.5,
     bandpassMax: 45,
-    reReferencing: "average",
-    normalization: "z_score",
-  });
-
-  const [artifacts, setArtifacts] = useState<ArtifactRemovalConfig>({
-    method: "ica",
-    detectEyeBlinks: true,
-    detectMuscle: true,
-    detectEcg: true,
-    detectBadChannels: true,
+    filterOrder: 4,
+    /**
+     * Defaults to no re-referencing.
+     *
+     * Common average referencing legitimately removes the spatially broad
+     * component of the signal, which for a sleep recording is most of the delta
+     * the whole analysis is about. Making it the default meant the headline
+     * measurement was attenuated before the user had chosen anything.
+     */
+    reReferencing: "none",
+    normalization: "none",
+  },
+  artifacts: {
+    eogRegression: true,
+    muscleSuppression: true,
+    ecgTemplateRemoval: true,
+    badChannelRepair: true,
     artifactThreshold: 2.5,
-  });
+  },
+  features: { windowSeconds: 2, overlap: 0.5, epochSeconds: 4 },
+  prediction: { enabled: true },
+};
 
-  const [features, setFeatures] = useState<FeatureExtractionConfig>({
-    method: "traditional",
-    traditionalBands: {
-      delta: true,
-      theta: true,
-      alpha: true,
-      beta: true,
-      gamma: true,
-    },
-    modernEmbeddingModel: "transformer",
-  });
+const CELL_SECTIONS: Record<Exclude<CellId, "acquire">, keyof PipelineConfig> = {
+  preprocess: "preprocessing",
+  artifacts: "artifacts",
+  features: "features",
+  classify: "prediction",
+};
 
-  const [prediction, setPrediction] = useState<PredictionConfig>({
-    enabled: true,
-    modelType: "transformer_classifier",
-    targetScenario: "sleep",
-  });
+function cloneConfig(config: PipelineConfig): PipelineConfig {
+  return {
+    preprocessing: { ...config.preprocessing },
+    artifacts: { ...config.artifacts },
+    features: { ...config.features },
+    prediction: { ...config.prediction },
+  };
+}
 
-  // 2. Calculated EEG Dataset Output
-  const [dataset, setDataset] = useState<EegAnalysisResult | null>(null);
-  const [showCleaned, setShowCleaned] = useState<boolean>(true);
-  const [selectedChannel, setSelectedChannel] = useState<string>("F3");
-  const [selectedBand, setSelectedBand] = useState<"delta" | "theta" | "alpha" | "beta" | "gamma">("alpha");
+export default function App() {
+  const [scenarioId, setScenarioId] = useState<EegScenarioId>("sleep");
+  const [seed, setSeed] = useState(20260101);
 
-  // 3. Notebook Cells State (for Jupyter layout)
-  const [cellStates, setCellStates] = useState<Record<string, "idle" | "running" | "success" | "error">>({
-    upload: "success",
-    preprocessing: "success",
-    artifact: "success",
-    features: "success",
-    prediction: "success",
-  });
+  /**
+   * Two copies of the configuration: what the controls show, and what produced the
+   * charts.
+   *
+   * Previously every control wrote straight to state while nothing recomputed, so
+   * a cell could read "Complete" beside numbers generated under different settings.
+   * Keeping the applied configuration separate makes the difference visible — cells
+   * show "Settings changed" until they are run — and stops a full re-filter from
+   * firing on every keystroke in a number field.
+   */
+  const [draft, setDraft] = useState<PipelineConfig>(() => cloneConfig(DEFAULT_CONFIG));
+  const [applied, setApplied] = useState<PipelineConfig>(() => cloneConfig(DEFAULT_CONFIG));
 
-  const [cellLogs, setCellLogs] = useState<Record<string, string[]>>({
-    upload: [
-      "MNE-Python: Found 8 active channels in standard 10-20 system.",
-      "MNE-Python: Sampling frequency is 128 Hz. Epoch window: 20 seconds.",
-      "MNE-Python: Successfully loaded scenario polysomnography preset.",
-    ],
-    preprocessing: [
-      "MNE-Python: Applied 50Hz zero-phase Butterworth notch filter.",
-      "MNE-Python: Applied bandpass filter between 0.5 Hz and 45.0 Hz.",
-      "MNE-Python: Computed common average reference (CAR) across 8 electrodes.",
-    ],
-    artifact: [
-      "FastICA: Extracted 8 components from EEG recording matrix.",
-      "FastICA: Identified Component 0 as Frontal Eye Blink activity (92% confidence).",
-      "FastICA: Identified Component 4 as Muscle artifact on Temporal channels.",
-      "FastICA: Reconstructed cleansed EEG waveform matrix successfully.",
-    ],
-    features: [
-      "Welch FFT: Extracted power spectral density values (Delta, Theta, Alpha, Beta, Gamma).",
-      "ViT-EEG Embeddings: Computed 128-dimension spatiotemporal embedding vectors.",
-    ],
-    prediction: [
-      "EEG-Conformer: Loaded pretrained sleep classification network.",
-      "Inference: Scoring segmented 4-second epochs...",
-      "Hypnogram scoring complete: Wake (0-4s), N1 (4-8s), N2 (8-12s), N3 (12-16s), REM (16-20s).",
-    ],
-  });
+  const [recording, setRecording] = useState<EegRecording | null>(null);
+  const [importError, setImportError] = useState("");
+  const [selectedChannel, setSelectedChannel] = useState("");
+  const [selectedBand, setSelectedBand] = useState<BandName>("delta");
+  const [showRaw, setShowRaw] = useState(true);
+  const [logScale, setLogScale] = useState(true);
+  const [runningCell, setRunningCell] = useState<CellId | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Load simulated scenario on initial boot or on scenario ID shift
+  // --- Recording -----------------------------------------------------------
+  const loadScenario = useCallback((id: EegScenarioId, withSeed: number) => {
+    const next = simulateRecording({ scenarioId: id, seed: withSeed });
+    setRecording(next);
+    setImportError("");
+    setSelectedChannel((prev) => (next.channels.includes(prev) ? prev : next.channels[0]));
+    setSelectedBand(
+      id === "sleep" ? "delta" : id === "workload" ? "beta" : id === "meditation" ? "alpha" : "theta",
+    );
+  }, []);
+
   useEffect(() => {
-    runFullPipeline(activeScenarioId);
-  }, [activeScenarioId]);
+    loadScenario(scenarioId, seed);
+  }, [scenarioId, seed, loadScenario]);
 
-  // Run the full dataset computation representing the execution pipeline
-  const runFullPipeline = (scId: EegScenarioId) => {
-    const rawResult = generateEegData(scId);
-    setDataset(rawResult);
-    
-    // Pick appropriate defaults for scenario channels
-    const availableChannels = EEG_SCENARIOS[scId].channels;
-    if (!availableChannels.includes(selectedChannel)) {
-      setSelectedChannel(availableChannels[0]);
+  // --- Pipeline ------------------------------------------------------------
+  const processed = useMemo(
+    () => (recording ? runPipeline(recording, applied) : null),
+    [recording, applied],
+  );
+
+  const staleCells = useMemo(() => {
+    const stale = new Set<CellId>();
+    for (const [cell, section] of Object.entries(CELL_SECTIONS) as [
+      Exclude<CellId, "acquire">,
+      keyof PipelineConfig,
+    ][]) {
+      if (JSON.stringify(draft[section]) !== JSON.stringify(applied[section])) stale.add(cell);
     }
-    
-    // Choose appropriate default band based on scenario
-    if (scId === "sleep") setSelectedBand("delta");
-    else if (scId === "meditation") setSelectedBand("alpha");
-    else if (scId === "workload") setSelectedBand("beta");
-    else setSelectedBand("delta");
+    return stale;
+  }, [draft, applied]);
+
+  const statusFor = (cell: CellId): CellStatus => {
+    if (runningCell === cell) return "running";
+    if (cell === "acquire") return recording ? "success" : "idle";
+    return staleCells.has(cell) ? "stale" : "success";
   };
 
-  // Run Cell Handlers (Simulate interactive notebook compilation)
-  const runCell = (cellId: string) => {
-    setCellStates((prev) => ({ ...prev, [cellId]: "running" }));
-    
-    let logs: string[] = [];
-    if (cellId === "upload") {
-      logs = [
-        "MNE-Python: Initializing file reader...",
-        `MNE-Python: Mapping channels for preset: ${EEG_SCENARIOS[activeScenarioId].name}`,
-        `MNE-Python: Logged ${EEG_SCENARIOS[activeScenarioId].channels.length} channels at ${EEG_SCENARIOS[activeScenarioId].sampleRate}Hz.`,
-        "MNE-Python: Dataset loaded and ready.",
-      ];
-    } else if (cellId === "preprocessing") {
-      logs = [
-        `MNE-Python: Tuning notch filter to ${preprocessing.notchFrequency}Hz...`,
-        preprocessing.bandpassEnabled 
-          ? `MNE-Python: Butterworth bandpass filter coefficients resolved (${preprocessing.bandpassMin}Hz - ${preprocessing.bandpassMax}Hz).`
-          : "MNE-Python: Bandpass filter bypassed.",
-        `MNE-Python: Applying spatial reference layout: ${preprocessing.reReferencing.toUpperCase()}`,
-        `MNE-Python: Normalization method: ${preprocessing.normalization}`,
-      ];
-    } else if (cellId === "artifact") {
-      logs = [
-        `ArtifactEngine: Running spatial filter algorithm: ${artifacts.method.toUpperCase()}`,
-        artifacts.detectEyeBlinks ? "ArtifactEngine: Fitting blink spatial templates..." : "",
-        artifacts.detectMuscle ? "ArtifactEngine: Flagging temporal muscle tremor frequencies..." : "",
-        "ArtifactEngine: Waveform reconstruction finished.",
-      ].filter(Boolean);
-    } else if (cellId === "features") {
-      logs = [
-        "Welch FFT: Initializing 256-point Hamming windows with 50% overlap.",
-        features.method === "traditional" 
-          ? "Welch FFT: Integrating Delta (0.5-4Hz), Theta (4-8Hz), Alpha (8-12Hz), Beta (12-30Hz), Gamma (30-50Hz) power spectral density arrays."
-          : `Modern Model: Resolving BCI embedding values via ${features.modernEmbeddingModel.toUpperCase()} encoder.`,
-      ];
-    } else {
-      // prediction
-      logs = [
-        `Model: Instantiating deep classifier of type: ${prediction.modelType.toUpperCase()}`,
-        "Model: Evaluating temporal vectors against scenario targets...",
-        "Model: Resolving classification states successfully.",
-      ];
-    }
-
-    setCellLogs((prev) => ({ ...prev, [cellId]: ["Compiling cell...", ...logs] }));
-
-    setTimeout(() => {
-      setCellStates((prev) => ({ ...prev, [cellId]: "success" }));
-      // Run calculations if it affects dataset output
-      if (cellId === "upload") {
-        runFullPipeline(activeScenarioId);
-      }
-    }, 1200);
+  const commit = (cell: CellId) => {
+    setRunningCell(cell);
+    // One frame of "running" so the state change is visible on fast machines,
+    // then the synchronous pipeline runs via the memo.
+    requestAnimationFrame(() => {
+      setApplied(cloneConfig(draft));
+      setRunningCell(null);
+    });
   };
 
-  // Custom File Uploader simulation
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-      const file = e.target.files[0];
-      setCellStates((prev) => ({ ...prev, upload: "running" }));
-      setCellLogs((prev) => ({
-        ...prev,
-        upload: [
-          "FileExplorer: Intercepted manual upload stream.",
-          `FileExplorer: File Name: ${file.name}`,
-          `FileExplorer: Size: ${(file.size / 1024).toFixed(1)} KB`,
-          "FileExplorer: Automatically formatting and mapping tabular headers...",
-          "MNE-Python: Extracted 8 columns of microvolt potentials.",
-          "MNE-Python: Auto-referencing mapping succeeded.",
-        ],
-      }));
+  const runAll = () => {
+    setRunningCell("preprocess");
+    requestAnimationFrame(() => {
+      setApplied(cloneConfig(draft));
+      setRunningCell(null);
+    });
+  };
 
-      setTimeout(() => {
-        setCellStates((prev) => ({ ...prev, upload: "success" }));
-        runFullPipeline("sleep"); // default to sleep staging with the uploaded file
-      }, 1500);
+  const handleFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setImportError("");
+    try {
+      const text = await file.text();
+      const { recording: parsed } = parseDelimitedText(text, file.name, 256);
+      setRecording(parsed);
+      setSelectedChannel(parsed.channels[0]);
+    } catch (error) {
+      setImportError((error as Error).message);
+    } finally {
+      // Reset so selecting the same file again re-triggers the change event.
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
-  const activeScenario = EEG_SCENARIOS[activeScenarioId];
-  const currentLabel = dataset?.dataPoints?.[0]?.predictedLabel || "Unknown State";
+  const scenario = recording?.scenarioId ? EEG_SCENARIOS[recording.scenarioId] : null;
+  const bandRow = processed?.bandPower.find((row) => row.channel === selectedChannel);
+  const psd = processed && selectedChannel ? processed.psd[selectedChannel] : undefined;
+  const nyquist = recording ? recording.sampleRate / 2 : 0;
+
+  const update = <K extends keyof PipelineConfig>(section: K, patch: Partial<PipelineConfig[K]>) => {
+    setDraft((prev) => ({ ...prev, [section]: { ...prev[section], ...patch } }));
+  };
+
+  if (!recording || !processed) {
+    return (
+      <div className="min-h-screen bg-gray-950 text-gray-400 flex items-center justify-center font-mono text-sm">
+        Generating recording…
+      </div>
+    );
+  }
+
+  const metrics = processed.metrics;
 
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans" id="app-root">
-      {/* 1. Main Navigation Header */}
-      <header className="border-b border-gray-800 bg-gray-900/60 backdrop-blur-md px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-4 sticky top-0 z-30" id="main-header">
+    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col">
+      <header className="border-b border-gray-800 bg-gray-900/60 backdrop-blur-md px-5 py-3.5 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3 sticky top-0 z-30">
         <div className="flex items-center gap-3">
           <div className="bg-cyan-500/10 border border-cyan-500/20 p-2 rounded-xl text-cyan-400">
-            <Brain className="w-6 h-6 stroke-[1.5]" />
+            <Brain className="w-5 h-5" />
           </div>
           <div>
-            <h1 className="text-lg font-bold text-gray-100 tracking-tight flex items-center gap-2">
+            <h1 className="text-base font-bold tracking-tight flex flex-wrap items-center gap-2">
               EEG Signal Explorer
               <span className="text-[10px] uppercase font-mono font-bold bg-cyan-950 text-cyan-400 border border-cyan-800 px-2 py-0.5 rounded-full">
-                Jupyter Workspace v2.0
+                {recording.source === "simulated" ? "synthetic" : "imported"}
               </span>
             </h1>
-            <p className="text-xs text-gray-400">Polished web-interface & ML-assisted neurophysiological analytics</p>
+            <p className="text-[11px] text-gray-400">
+              {recording.channels.length} channels · {recording.sampleRate} Hz · Nyquist {nyquist} Hz
+              · {recording.durationSeconds.toFixed(0)}s · pipeline {processed.elapsedMs.toFixed(0)}ms
+            </p>
           </div>
         </div>
 
-        {/* Clinical Scenario Selector Dropdown */}
-        <div className="flex items-center gap-2 bg-gray-950 border border-gray-800 rounded-xl p-1.5 self-stretch sm:self-auto">
-          <span className="text-xs font-mono text-gray-500 px-2 font-bold uppercase select-none">Scenario</span>
-          <select
-            value={activeScenarioId}
-            onChange={(e) => setActiveScenarioId(e.target.value as EegScenarioId)}
-            className="bg-gray-900 border border-gray-800 rounded-lg text-xs font-semibold px-3 py-1.5 text-gray-200 focus:outline-none focus:border-cyan-500 cursor-pointer"
+        <div className="flex flex-wrap items-center gap-2">
+          <label className="flex items-center gap-2 bg-gray-950 border border-gray-800 rounded-xl px-2 py-1.5">
+            <span className="text-[10px] font-mono text-gray-500 uppercase font-bold">Preset</span>
+            <select
+              value={recording.scenarioId ?? ""}
+              onChange={(e) => setScenarioId(e.target.value as EegScenarioId)}
+              className="bg-gray-900 border border-gray-800 rounded-lg text-xs font-semibold px-2 py-1 text-gray-200 focus:border-cyan-500 outline-none cursor-pointer"
+            >
+              {!recording.scenarioId && <option value="">Imported file</option>}
+              {Object.values(EEG_SCENARIOS).map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {/* A visible seed makes runs reproducible and comparable. */}
+          <label className="flex items-center gap-1.5 bg-gray-950 border border-gray-800 rounded-xl px-2 py-1.5">
+            <span className="text-[10px] font-mono text-gray-500 uppercase font-bold">Seed</span>
+            <input
+              type="number"
+              value={seed}
+              onChange={(e) => setSeed(Number(e.target.value) || 0)}
+              className="w-24 bg-gray-900 border border-gray-800 rounded px-1.5 py-0.5 text-xs font-mono text-gray-200"
+            />
+            <button
+              type="button"
+              onClick={() => setSeed(Math.floor(Math.random() * 1e8))}
+              title="New random seed"
+              className="p-1 text-gray-400 hover:text-cyan-400 transition-colors"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+            </button>
+          </label>
+
+          <button
+            type="button"
+            onClick={runAll}
+            disabled={staleCells.size === 0}
+            className="flex items-center gap-1.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-800 disabled:text-gray-500 text-white text-xs font-medium px-3 py-2 rounded-xl transition-colors"
           >
-            {Object.values(EEG_SCENARIOS).map((sc) => (
-              <option key={sc.id} value={sc.id}>
-                {sc.name}
-              </option>
-            ))}
-          </select>
+            <Play className="w-3.5 h-3.5 fill-current" />
+            Run all{staleCells.size ? ` (${staleCells.size})` : ""}
+          </button>
         </div>
       </header>
 
-      {/* 2. Global Metric Statistics Dashboard Bar */}
-      {dataset && (
-        <section className="bg-gray-900/25 border-b border-gray-800/80 px-6 py-3.5 grid grid-cols-2 md:grid-cols-4 gap-4" id="stats-dashboard">
-          {/* Estimated Heart Rate */}
-          <div className="flex items-center gap-3 bg-gray-900/45 border border-gray-850 p-2.5 rounded-xl">
-            <div className="bg-red-500/10 border border-red-500/10 p-2 rounded-lg text-red-400">
-              <Heart className="w-4 h-4 animate-pulse" />
-            </div>
-            <div>
-              <span className="text-[10px] text-gray-500 font-mono block uppercase">ECG Est. Pulse</span>
-              <span className="text-sm font-semibold text-gray-200 font-mono">
-                {dataset.globalMetrics.averageHeartRate} <span className="text-[10px] text-gray-400">BPM</span>
-              </span>
-            </div>
-          </div>
+      {/* Metrics, all measured from the signal rather than looked up. */}
+      <section className="bg-gray-900/25 border-b border-gray-800/80 px-5 py-3 grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3">
+        <MetricTile
+          icon={<Heart className="w-4 h-4" />}
+          tone="red"
+          label="Heart rate"
+          value={metrics.heartRateBpm === null ? "not detected" : `${metrics.heartRateBpm}`}
+          unit={metrics.heartRateBpm === null ? "" : "bpm"}
+          hint={
+            recording.trueHeartRateBpm
+              ? `simulated at ${recording.trueHeartRateBpm} bpm`
+              : "from the ECG lead"
+          }
+        />
+        <MetricTile
+          icon={<Eye className="w-4 h-4" />}
+          tone="blue"
+          label="Ocular events"
+          value={String(metrics.blinkCount)}
+          unit="detected"
+          hint={
+            recording.blinkEventCount !== undefined
+              ? `${recording.blinkEventCount} simulated`
+              : "peak detection on frontal contrast"
+          }
+        />
+        <MetricTile
+          icon={<AlertTriangle className="w-4 h-4" />}
+          tone="amber"
+          label="Noise floor"
+          value={metrics.noiseFloorRms.toFixed(2)}
+          unit="µV RMS"
+          hint="above 45 Hz, after cleaning"
+        />
+        <MetricTile
+          icon={<Zap className="w-4 h-4" />}
+          tone="cyan"
+          label="Artifact coverage"
+          value={`${(metrics.artifactRatio * 100).toFixed(1)}`}
+          unit="% of samples"
+          hint="union of all masks, not a sum"
+        />
+        <MetricTile
+          icon={<Activity className="w-4 h-4" />}
+          tone={
+            metrics.recoveryR !== null && metrics.baselineR !== null && metrics.recoveryR >= metrics.baselineR
+              ? "emerald"
+              : "red"
+          }
+          label="Recovery"
+          value={
+            metrics.recoveryR === null
+              ? "n/a"
+              : `${metrics.baselineR?.toFixed(2)} → ${metrics.recoveryR.toFixed(2)}`
+          }
+          unit={metrics.recoveryR === null ? "" : "r vs truth"}
+          hint={metrics.recoveryR === null ? "imported data has no ground truth" : "same reference both sides"}
+        />
+      </section>
 
-          {/* Transient Blinks */}
-          <div className="flex items-center gap-3 bg-gray-900/45 border border-gray-850 p-2.5 rounded-xl">
-            <div className="bg-blue-500/10 border border-blue-500/10 p-2 rounded-lg text-blue-400">
-              <Eye className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="text-[10px] text-gray-500 font-mono block uppercase">Blink Transients</span>
-              <span className="text-sm font-semibold text-gray-200 font-mono">
-                {dataset.globalMetrics.blinkCount} <span className="text-[10px] text-gray-400">counts</span>
-              </span>
-            </div>
-          </div>
-
-          {/* Noise Floor */}
-          <div className="flex items-center gap-3 bg-gray-900/45 border border-gray-850 p-2.5 rounded-xl">
-            <div className="bg-amber-500/10 border border-amber-500/10 p-2 rounded-lg text-amber-400">
-              <AlertTriangle className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="text-[10px] text-gray-500 font-mono block uppercase">Noise Floor RMS</span>
-              <span className="text-sm font-semibold text-gray-200 font-mono">
-                {dataset.globalMetrics.noiseLevel} <span className="text-[10px] text-gray-400">μV</span>
-              </span>
-            </div>
-          </div>
-
-          {/* Artifact Ratio */}
-          <div className="flex items-center gap-3 bg-gray-900/45 border border-gray-850 p-2.5 rounded-xl">
-            <div className="bg-cyan-500/10 border border-cyan-500/10 p-2 rounded-lg text-cyan-400">
-              <Zap className="w-4 h-4" />
-            </div>
-            <div>
-              <span className="text-[10px] text-gray-500 font-mono block uppercase">Artifact Ratio</span>
-              <span className="text-sm font-semibold text-gray-200 font-mono">
-                {Math.round(dataset.globalMetrics.overallArtifactRatio * 100)}%
-              </span>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* 3. Main Workspace Grid split: Left=Notebook, Right=Visualizations */}
-      <main className="flex-1 grid grid-cols-1 xl:grid-cols-12 gap-6 p-6 overflow-hidden" id="workspace-grid">
-        
-        {/* LEFT COLUMN: Notebook/Jupyter Pipeline Workspace */}
-        <section className="xl:col-span-5 flex flex-col gap-5 overflow-y-auto max-h-[calc(100vh-180px)] pr-2" id="notebook-column">
-          <div className="flex items-center gap-2 mb-1">
+      <main className="flex-1 grid grid-cols-1 xl:grid-cols-12 gap-5 p-5">
+        {/* ---------------- Notebook column ---------------- */}
+        <section className="xl:col-span-5 flex flex-col gap-4 xl:max-h-[calc(100vh-190px)] xl:overflow-y-auto xl:pr-2 [&>*]:shrink-0">
+          <div className="flex items-center gap-2">
             <BookOpen className="w-4 h-4 text-cyan-400" />
-            <h2 className="text-xs uppercase font-mono tracking-wider text-gray-400 font-bold">EEG Processing Notebook</h2>
+            <h2 className="text-xs uppercase font-mono tracking-wider text-gray-400 font-bold">
+              Pipeline
+            </h2>
           </div>
 
-          {/* Cell 1: Upload / Load Dataset */}
-          <NotebookCellComponent
-            id="upload"
-            title="Cell 1: Acquire EEG Datastream"
-            codeSnippet={`# MNE-Python pipeline cell\nimport mne\n\nraw_data_path = "eeg_records/${activeScenarioId}.edf"\nraw = mne.io.read_raw_edf(raw_data_path, preload=True)\nprint(f"Channels: {raw.ch_names}")\nprint(f"Sampling frequency: {raw.info['sfreq']} Hz")`}
-            status={cellStates.upload}
-            onRun={() => runCell("upload")}
-            consoleLogs={cellLogs.upload}
+          <NotebookCell
+            id="acquire"
+            index={1}
+            title="Acquire recording"
+            subtitle={recording.name}
+            status={statusFor("acquire")}
+            onRun={() => loadScenario(scenarioId, seed)}
+            codeSnippet={`import mne\n\nraw = mne.io.read_raw_edf("${recording.name}", preload=True)\nprint(raw.info["sfreq"], raw.ch_names)`}
+            consoleLogs={[
+              processed.log[0] ?? "",
+              ...(recording.importNotes ?? []),
+              ...(recording.knownBadChannels?.length
+                ? [`Simulation planted a bad electrode at ${recording.knownBadChannels.join(", ")}.`]
+                : []),
+            ].filter(Boolean)}
           >
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <label className="text-xs text-gray-400 block mb-1">Selected Preset Scenario</label>
-                <p className="text-xs font-semibold text-gray-200 mb-2">{activeScenario.name}</p>
-                <p className="text-[11px] text-gray-500 leading-normal">{activeScenario.description}</p>
-              </div>
-              
-              {/* Custom Uploader widget */}
-              <div className="border border-dashed border-gray-800 rounded-xl bg-gray-950 p-4 flex flex-col items-center justify-center text-center cursor-pointer hover:border-cyan-500 transition-colors group relative">
-                <Upload className="w-6 h-6 text-gray-600 group-hover:text-cyan-400 transition-colors mb-2" />
-                <span className="text-xs font-medium text-gray-400 group-hover:text-cyan-300">Upload EDF/BDF/CSV/MAT</span>
-                <span className="text-[9px] text-gray-600 mt-0.5">Drag-and-drop or select file</span>
-                <input
-                  type="file"
-                  accept=".edf,.bdf,.csv,.mat,.npy"
-                  onChange={handleFileUpload}
-                  className="absolute inset-0 opacity-0 cursor-pointer"
-                />
-              </div>
-            </div>
-          </NotebookCellComponent>
-
-          {/* Cell 2: Preprocessing Config */}
-          <NotebookCellComponent
-            id="preprocessing"
-            title="Cell 2: Signal Preprocessing"
-            codeSnippet={`# Digital Signal Filtering & Re-referencing\n# 50/60Hz notch and bandpass Butterworth filters\nraw.notch_filter(freqs=${preprocessing.notchFrequency})\nraw.filter(l_freq=${preprocessing.bandpassMin}, h_freq=${preprocessing.bandpassMax})\nraw_ref, _ = mne.set_eeg_reference(raw, ref_channels="${preprocessing.reReferencing}")`}
-            status={cellStates.preprocessing}
-            onRun={() => runCell("preprocessing")}
-            consoleLogs={cellLogs.preprocessing}
-          >
-            <div className="grid grid-cols-2 gap-4 text-xs">
-              {/* Notch parameters */}
-              <div className="space-y-2 border-r border-gray-850 pr-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-gray-400 font-medium">Notch Filter</span>
-                  <input
-                    type="checkbox"
-                    checked={preprocessing.notchFilter}
-                    onChange={(e) => setPreprocessing({ ...preprocessing, notchFilter: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                </div>
-                <div>
-                  <span className="text-[10px] text-gray-500 uppercase block mb-1">Frequency (Hz)</span>
-                  <select
-                    value={preprocessing.notchFrequency}
-                    onChange={(e) => setPreprocessing({ ...preprocessing, notchFrequency: parseInt(e.target.value) })}
-                    className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                  >
-                    <option value="50">50 Hz (Europe/Asia)</option>
-                    <option value="60">60 Hz (Americas)</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Bandpass cuts */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-gray-400 font-medium">Bandpass Filter</span>
-                  <input
-                    type="checkbox"
-                    checked={preprocessing.bandpassEnabled}
-                    onChange={(e) => setPreprocessing({ ...preprocessing, bandpassEnabled: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-2 text-[10px]">
-                  <div>
-                    <span className="text-gray-500 block mb-0.5">Low Cut (Hz)</span>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={preprocessing.bandpassMin}
-                      onChange={(e) => setPreprocessing({ ...preprocessing, bandpassMin: parseFloat(e.target.value) })}
-                      className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                    />
-                  </div>
-                  <div>
-                    <span className="text-gray-500 block mb-0.5">High Cut (Hz)</span>
-                    <input
-                      type="number"
-                      step="1"
-                      value={preprocessing.bandpassMax}
-                      onChange={(e) => setPreprocessing({ ...preprocessing, bandpassMax: parseFloat(e.target.value) })}
-                      className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                    />
-                  </div>
-                </div>
-              </div>
-
-              {/* Spatial reference */}
-              <div className="col-span-2 grid grid-cols-2 gap-4 border-t border-gray-850 pt-3">
-                <div>
-                  <span className="text-gray-400 font-medium block mb-1">EEG Spatial Referencing</span>
-                  <select
-                    value={preprocessing.reReferencing}
-                    onChange={(e) => setPreprocessing({ ...preprocessing, reReferencing: e.target.value as any })}
-                    className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                  >
-                    <option value="average">Common Average Reference (CAR)</option>
-                    <option value="linked_earlobes">Linked Earlobes (A1+A2)</option>
-                    <option value="none">None (Bipolar/Original Reference)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <span className="text-gray-400 font-medium block mb-1">Amplitude Normalization</span>
-                  <select
-                    value={preprocessing.normalization}
-                    onChange={(e) => setPreprocessing({ ...preprocessing, normalization: e.target.value as any })}
-                    className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                  >
-                    <option value="z_score">Z-Score Normalization</option>
-                    <option value="min_max">Min-Max Scaling</option>
-                    <option value="none">Bypass Normalization</option>
-                  </select>
-                </div>
-              </div>
-            </div>
-          </NotebookCellComponent>
-
-          {/* Cell 3: Artifact Removal */}
-          <NotebookCellComponent
-            id="artifact"
-            title="Cell 3: Artifact Component Extraction"
-            codeSnippet={`# ML-assisted Artifact Extraction (FastICA / Autoencoder)\nfrom mne.preprocessing import ICA\n\nica = ICA(n_components=8, random_state=42, method="${artifacts.method}")\nica.fit(raw)\n\n# Flag components containing ocular (blink) or cardiac signals\nbad_idx = ica.find_bads_eog(raw, threshold=${artifacts.artifactThreshold})[0]\nica.exclude = bad_idx\ncleaned_raw = ica.apply(raw.copy())`}
-            status={cellStates.artifact}
-            onRun={() => runCell("artifact")}
-            consoleLogs={cellLogs.artifact}
-          >
-            <div className="grid grid-cols-2 gap-4 text-xs">
-              <div>
-                <label className="text-gray-400 font-medium block mb-1">Filter Architecture</label>
-                <select
-                  value={artifacts.method}
-                  onChange={(e) => setArtifacts({ ...artifacts, method: e.target.value as any })}
-                  className="bg-gray-900 border border-gray-800 text-xs rounded p-1.5 w-full text-gray-300"
-                >
-                  <option value="ica">FastICA (Independent Component Analysis)</option>
-                  <option value="autoencoder">Deep Denoising Autoencoder</option>
-                  <option value="transformer">Spatiotemporal Transformer Filter</option>
-                  <option value="cnn">1D-Conv Waveform Filter</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="text-gray-400 font-medium block mb-1">Component Flagging Threshold</label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="range"
-                    min="1.5"
-                    max="4.0"
-                    step="0.1"
-                    value={artifacts.artifactThreshold}
-                    onChange={(e) => setArtifacts({ ...artifacts, artifactThreshold: parseFloat(e.target.value) })}
-                    className="flex-1 accent-cyan-500 h-1 rounded bg-gray-850"
-                  />
-                  <span className="font-mono text-cyan-400 text-xs font-bold">{artifacts.artifactThreshold}σ</span>
-                </div>
-              </div>
-
-              <div className="col-span-2 border-t border-gray-850 pt-3 grid grid-cols-2 md:grid-cols-4 gap-3">
-                <label className="flex items-center gap-2 cursor-pointer text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={artifacts.detectEyeBlinks}
-                    onChange={(e) => setArtifacts({ ...artifacts, detectEyeBlinks: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                  <span>Eye Blinks</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={artifacts.detectMuscle}
-                    onChange={(e) => setArtifacts({ ...artifacts, detectMuscle: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                  <span>Muscle Noise</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={artifacts.detectEcg}
-                    onChange={(e) => setArtifacts({ ...artifacts, detectEcg: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                  <span>ECG Leakage</span>
-                </label>
-                <label className="flex items-center gap-2 cursor-pointer text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={artifacts.detectBadChannels}
-                    onChange={(e) => setArtifacts({ ...artifacts, detectBadChannels: e.target.checked })}
-                    className="accent-cyan-500"
-                  />
-                  <span>Flat Channels</span>
-                </label>
-              </div>
-            </div>
-          </NotebookCellComponent>
-
-          {/* Cell 4: Feature Extraction */}
-          <NotebookCellComponent
-            id="features"
-            title="Cell 4: Bio-Feature Spectral Extraction"
-            codeSnippet={`# Traditional Power Spectral Density (Welch Periodogram)\n# computes the absolute microvolt potential per band\nfrom mne.time_frequency import psd_welch\n\npsds, freqs = psd_welch(cleaned_raw, fmin=0.5, fmax=50.0, n_fft=256)\nprint(f"Bands: Delta, Theta, Alpha, Beta, Gamma calculated.")`}
-            status={cellStates.features}
-            onRun={() => runCell("features")}
-            consoleLogs={cellLogs.features}
-          >
-            <div className="grid grid-cols-2 gap-4 text-xs">
-              <div>
-                <label className="text-gray-400 font-medium block mb-1">Extraction Methodology</label>
-                <div className="flex gap-4 mt-1">
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="feat_method"
-                      checked={features.method === "traditional"}
-                      onChange={() => setFeatures({ ...features, method: "traditional" })}
-                      className="accent-cyan-500"
-                    />
-                    <span>Traditional FFT (PSD)</span>
-                  </label>
-                  <label className="flex items-center gap-2 cursor-pointer">
-                    <input
-                      type="radio"
-                      name="feat_method"
-                      checked={features.method === "modern"}
-                      onChange={() => setFeatures({ ...features, method: "modern" })}
-                      className="accent-cyan-500"
-                    />
-                    <span>AI Latent Embeddings</span>
-                  </label>
-                </div>
-              </div>
-
-              {features.method === "traditional" ? (
-                <div>
-                  <label className="text-gray-400 font-medium block mb-1.5">Compute Bands</label>
-                  <div className="flex flex-wrap gap-2 text-[10px]">
-                    {Object.keys(features.traditionalBands).map((band) => (
-                      <span key={band} className="bg-gray-900 border border-gray-800 px-2 py-1 rounded-md text-cyan-400 font-mono capitalize">
-                        {band}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  <label className="text-gray-400 font-medium block mb-1">AI Transformer Backbone</label>
-                  <select
-                    value={features.modernEmbeddingModel}
-                    onChange={(e) => setFeatures({ ...features, modernEmbeddingModel: e.target.value as any })}
-                    className="bg-gray-900 border border-gray-800 text-xs rounded p-1 w-full text-gray-300"
-                  >
-                    <option value="transformer">EEG-Conformer (Vision Transformer)</option>
-                    <option value="cnn">1D CNN-WaveNet Encoder</option>
-                    <option value="wavenet">Wavelet CNN Network</option>
-                  </select>
-                </div>
-              )}
-            </div>
-          </NotebookCellComponent>
-
-          {/* Cell 5: ML Models Staging & Classification */}
-          <NotebookCellComponent
-            id="prediction"
-            title="Cell 5: Deep Learning Classifier"
-            codeSnippet={`# EEG Segment Classification via Deep Learning Classifier\nfrom bci_classifiers import EEGConformer\n\nmodel = EEGConformer(target_scenario="${activeScenarioId}", model_type="${prediction.modelType}")\npredictions, probabilities = model.evaluate_segments(cleaned_raw)\nprint(f"Scored segment classifications: {predictions}")`}
-            status={cellStates.prediction}
-            onRun={() => runCell("prediction")}
-            consoleLogs={cellLogs.prediction}
-          >
-            <div className="grid grid-cols-2 gap-4 text-xs">
-              <div>
-                <label className="text-gray-400 font-medium block mb-1">Neural Network Architecture</label>
-                <select
-                  value={prediction.modelType}
-                  onChange={(e) => setPrediction({ ...prediction, modelType: e.target.value as any })}
-                  className="bg-gray-900 border border-gray-800 text-xs rounded p-1.5 w-full text-gray-300 animate-fade-in"
-                >
-                  <option value="transformer_classifier">EEG-Conformer (Attention/Transformer)</option>
-                  <option value="lstm_network">Bi-LSTM Recurrent Neural Network</option>
-                  <option value="random_forest">MNE-Classical Random Forest</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="text-gray-400 font-medium block mb-1">Pipeline Objective</label>
-                <p className="text-cyan-400 font-mono text-xs font-bold mt-1.5 capitalize bg-cyan-950/40 border border-cyan-900/50 px-2 py-1 rounded inline-block">
-                  {activeScenarioId === "sleep" ? "Hypnogram Scoring" : activeScenarioId === "epilepsy" ? "Seizure Event Staging" : activeScenarioId === "workload" ? "Mental Workload Index" : "Zen Focus Coherence"}
+                <p className="text-xs font-semibold text-gray-200 mb-1">
+                  {scenario?.name ?? "Imported file"}
+                </p>
+                <p className="text-[11px] text-gray-500 leading-normal">
+                  {scenario?.description ??
+                    "Values are treated as microvolts. Add a time column to set the sample rate."}
                 </p>
               </div>
+              <div>
+                <label className="border border-dashed border-gray-800 rounded-xl bg-gray-950 p-3 flex flex-col items-center justify-center text-center cursor-pointer hover:border-cyan-500 transition-colors">
+                  <Upload className="w-5 h-5 text-gray-600 mb-1.5" />
+                  <span className="text-[11px] font-medium text-gray-400">Import CSV or TSV</span>
+                  <span className="text-[9px] text-gray-600 mt-0.5">one column per channel</span>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".csv,.tsv,.txt"
+                    onChange={handleFile}
+                    className="sr-only"
+                  />
+                </label>
+                {importError && (
+                  <p className="text-[10px] text-red-300 mt-1.5 font-mono">{importError}</p>
+                )}
+              </div>
             </div>
-          </NotebookCellComponent>
+          </NotebookCell>
+
+          <NotebookCell
+            id="preprocess"
+            index={2}
+            title="Filter and reference"
+            subtitle="zero-phase IIR, applied to every channel"
+            status={statusFor("preprocess")}
+            onRun={() => commit("preprocess")}
+            codeSnippet={`raw.notch_filter(freqs=${draft.preprocessing.notchFrequency})\nraw.filter(l_freq=${draft.preprocessing.bandpassMin}, h_freq=${draft.preprocessing.bandpassMax}, method="iir")\nraw.set_eeg_reference("${draft.preprocessing.reReferencing}")`}
+            consoleLogs={processed.log.slice(1, 5)}
+          >
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+              <Toggle
+                label="Notch filter"
+                checked={draft.preprocessing.notchFilter}
+                onChange={(v) => update("preprocessing", { notchFilter: v })}
+              />
+              <Toggle
+                label="Bandpass"
+                checked={draft.preprocessing.bandpassEnabled}
+                onChange={(v) => update("preprocessing", { bandpassEnabled: v })}
+              />
+
+              <Field label="Mains (Hz)">
+                <select
+                  value={draft.preprocessing.notchFrequency}
+                  onChange={(e) =>
+                    update("preprocessing", { notchFrequency: Number(e.target.value) })
+                  }
+                  className={inputClass}
+                >
+                  <option value={50}>50</option>
+                  <option value={60}>60</option>
+                </select>
+                {draft.preprocessing.notchFrequency >= nyquist && (
+                  <span className="text-[9px] text-amber-300 block mt-1">
+                    above Nyquist ({nyquist} Hz) — will be skipped
+                  </span>
+                )}
+              </Field>
+
+              <Field label="Filter order">
+                <select
+                  value={draft.preprocessing.filterOrder}
+                  onChange={(e) => update("preprocessing", { filterOrder: Number(e.target.value) })}
+                  className={inputClass}
+                >
+                  <option value={2}>2</option>
+                  <option value={4}>4</option>
+                  <option value={6}>6</option>
+                </select>
+              </Field>
+
+              <Field label="Low cut (Hz)">
+                <input
+                  type="number"
+                  step={0.1}
+                  min={0.05}
+                  max={nyquist * 0.9}
+                  value={draft.preprocessing.bandpassMin}
+                  onChange={(e) => update("preprocessing", { bandpassMin: Number(e.target.value) })}
+                  className={inputClass}
+                />
+              </Field>
+              <Field label="High cut (Hz)">
+                <input
+                  type="number"
+                  step={1}
+                  min={1}
+                  max={nyquist * 0.98}
+                  value={draft.preprocessing.bandpassMax}
+                  onChange={(e) => update("preprocessing", { bandpassMax: Number(e.target.value) })}
+                  className={inputClass}
+                />
+              </Field>
+
+              <Field label="Reference">
+                <select
+                  value={draft.preprocessing.reReferencing}
+                  onChange={(e) =>
+                    update("preprocessing", {
+                      reReferencing: e.target
+                        .value as PipelineConfig["preprocessing"]["reReferencing"],
+                    })
+                  }
+                  className={inputClass}
+                >
+                  <option value="none">As recorded</option>
+                  <option value="average">Common average</option>
+                  <option value="linked_mastoid">Linked mastoid</option>
+                </select>
+              </Field>
+
+              <Field label="Normalisation">
+                <select
+                  value={draft.preprocessing.normalization}
+                  onChange={(e) =>
+                    update("preprocessing", {
+                      normalization: e.target
+                        .value as PipelineConfig["preprocessing"]["normalization"],
+                    })
+                  }
+                  className={inputClass}
+                >
+                  <option value="none">None (keep µV)</option>
+                  <option value="z_score">Z-score (display)</option>
+                  <option value="min_max">Min–max (display)</option>
+                </select>
+              </Field>
+            </div>
+          </NotebookCell>
+
+          <NotebookCell
+            id="artifacts"
+            index={3}
+            title="Artifact correction"
+            subtitle="each step is a method that actually runs"
+            status={statusFor("artifacts")}
+            onRun={() => commit("artifacts")}
+            codeSnippet={`# Ocular: regress a frontal-minus-posterior estimate\n# Cardiac: average a beat template on the ECG lead and subtract\n# Muscle: band-limit windows where HF/LF ratio > ${draft.artifacts.artifactThreshold}\u03c3\n# Bad channels: inverse-distance interpolation from neighbours`}
+            consoleLogs={processed.log.filter((l) =>
+              /Bad channel|Ocular|Cardiac|Muscle|Recovery/.test(l),
+            )}
+          >
+            <div className="flex flex-col gap-3 text-xs">
+              <Field label={`Detection threshold — ${draft.artifacts.artifactThreshold.toFixed(1)}σ`}>
+                <input
+                  type="range"
+                  min={1.5}
+                  max={5}
+                  step={0.1}
+                  value={draft.artifacts.artifactThreshold}
+                  onChange={(e) =>
+                    update("artifacts", { artifactThreshold: Number(e.target.value) })
+                  }
+                  className="w-full accent-cyan-500"
+                />
+              </Field>
+              <div className="grid grid-cols-2 gap-2 border-t border-gray-850 pt-3">
+                <Toggle
+                  label="Ocular regression"
+                  checked={draft.artifacts.eogRegression}
+                  onChange={(v) => update("artifacts", { eogRegression: v })}
+                />
+                <Toggle
+                  label="Cardiac template"
+                  checked={draft.artifacts.ecgTemplateRemoval}
+                  onChange={(v) => update("artifacts", { ecgTemplateRemoval: v })}
+                />
+                <Toggle
+                  label="Muscle suppression"
+                  checked={draft.artifacts.muscleSuppression}
+                  onChange={(v) => update("artifacts", { muscleSuppression: v })}
+                />
+                <Toggle
+                  label="Bad-channel repair"
+                  checked={draft.artifacts.badChannelRepair}
+                  onChange={(v) => update("artifacts", { badChannelRepair: v })}
+                />
+              </div>
+              {processed.badChannels.length > 0 && (
+                <p className="text-[10px] font-mono text-amber-300">
+                  Repaired: {processed.badChannels.join(", ")}
+                </p>
+              )}
+            </div>
+          </NotebookCell>
+
+          <NotebookCell
+            id="features"
+            index={4}
+            title="Spectral features"
+            subtitle="Welch PSD, integrated per band"
+            status={statusFor("features")}
+            onRun={() => commit("features")}
+            codeSnippet={`from mne.time_frequency import psd_array_welch\n\npsds, freqs = psd_array_welch(\n    data, sfreq=${recording.sampleRate},\n    n_fft=${Math.round(draft.features.windowSeconds * recording.sampleRate)},\n    n_overlap=${Math.round(draft.features.windowSeconds * recording.sampleRate * draft.features.overlap)},\n)`}
+            consoleLogs={processed.log.filter((l) => /Welch|Normalisation/.test(l))}
+          >
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+              <Field label="Welch window (s)">
+                <select
+                  value={draft.features.windowSeconds}
+                  onChange={(e) => update("features", { windowSeconds: Number(e.target.value) })}
+                  className={inputClass}
+                >
+                  <option value={0.5}>0.5</option>
+                  <option value={1}>1</option>
+                  <option value={2}>2</option>
+                  <option value={4}>4</option>
+                </select>
+              </Field>
+              <Field label="Overlap">
+                <select
+                  value={draft.features.overlap}
+                  onChange={(e) => update("features", { overlap: Number(e.target.value) })}
+                  className={inputClass}
+                >
+                  <option value={0}>0%</option>
+                  <option value={0.25}>25%</option>
+                  <option value={0.5}>50%</option>
+                  <option value={0.75}>75%</option>
+                </select>
+              </Field>
+              <div className="col-span-2 text-[10px] font-mono text-gray-500">
+                Resolution {psd ? psd.resolution.toFixed(3) : "—"} Hz · {psd?.segments ?? 0} segments
+                averaged. Longer windows resolve frequency more finely and time less so.
+              </div>
+            </div>
+          </NotebookCell>
+
+          <NotebookCell
+            id="classify"
+            index={5}
+            title="Epoch classification"
+            subtitle="nearest centroid on log band power"
+            status={statusFor("classify")}
+            onRun={() => commit("classify")}
+            codeSnippet={`# Features per epoch: log band power + theta/alpha + slow/fast ratios\n# Classifier: minimum-distance to class centroid, softmax over -distance\n# Not a transformer, and no longer described as one.`}
+            consoleLogs={processed.log.filter((l) => /Classifier/.test(l))}
+          >
+            <div className="flex flex-col gap-3 text-xs">
+              <Toggle
+                label="Run classifier"
+                checked={draft.prediction.enabled}
+                onChange={(v) => update("prediction", { enabled: v })}
+              />
+              <Field label="Epoch length (s)">
+                <select
+                  value={draft.features.epochSeconds}
+                  onChange={(e) => update("features", { epochSeconds: Number(e.target.value) })}
+                  className={inputClass}
+                >
+                  <option value={2}>2</option>
+                  <option value={4}>4</option>
+                  <option value={5}>5</option>
+                  <option value={10}>10</option>
+                </select>
+              </Field>
+              {processed.classification?.accuracy !== null &&
+                processed.classification?.accuracy !== undefined && (
+                  <p className="text-[10px] font-mono text-gray-400">
+                    {(processed.classification.accuracy * 100).toFixed(1)}% agreement with the
+                    simulation's own labels over {processed.classification.epochs.length} epochs.
+                  </p>
+                )}
+            </div>
+          </NotebookCell>
+
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl p-4 flex flex-col gap-2.5">
+            <h3 className="text-xs uppercase font-mono tracking-wider text-gray-400 font-bold flex items-center gap-2">
+              <Download className="w-3.5 h-3.5 text-cyan-400" />
+              Export
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+              <ExportButton onClick={() => exportCleanedCsv(recording, processed)}>
+                Cleaned signal CSV
+              </ExportButton>
+              <ExportButton onClick={() => exportBandPowerCsv(recording, processed)}>
+                Band power CSV
+              </ExportButton>
+              <ExportButton onClick={() => exportRunReport(recording, processed, applied)}>
+                Run record (.md)
+              </ExportButton>
+            </div>
+            <p className="text-[10px] text-gray-500">
+              The run record carries the settings, the measurements and the log, so a result can be
+              reproduced from its seed.
+            </p>
+          </div>
         </section>
 
-        {/* RIGHT COLUMN: Professional Visualization Dashboard */}
-        <section className="xl:col-span-7 flex flex-col gap-6 overflow-y-auto max-h-[calc(100vh-180px)]" id="vis-desk-column">
-          {/* Header layout controls */}
-          <div className="flex justify-between items-center bg-gray-900/40 border border-gray-800 p-3.5 rounded-2xl shadow-lg">
+        {/* ---------------- Charts column ---------------- */}
+        <section className="xl:col-span-7 flex flex-col gap-5 xl:max-h-[calc(100vh-190px)] xl:overflow-y-auto [&>*]:shrink-0">
+          <div className="flex flex-wrap justify-between items-center gap-2 bg-gray-900/40 border border-gray-800 p-3 rounded-2xl">
             <div className="flex items-center gap-2">
               <Layers className="w-4 h-4 text-cyan-400" />
-              <h2 className="text-xs uppercase font-mono tracking-wider text-gray-400 font-bold">Interactive Analytics Desk</h2>
+              <h2 className="text-xs uppercase font-mono tracking-wider text-gray-400 font-bold">
+                Charts
+              </h2>
             </div>
-            
-            <div className="flex gap-2">
-              <span className="text-[10px] text-gray-500 font-mono flex items-center gap-1">
-                <span>Active channel:</span>
-                <span className="text-cyan-400 font-bold bg-cyan-950/30 border border-cyan-900 px-1.5 py-0.5 rounded">{selectedChannel}</span>
-              </span>
+            <div className="flex flex-wrap gap-1.5">
+              {recording.channels.map((ch) => (
+                <button
+                  key={ch}
+                  type="button"
+                  onClick={() => setSelectedChannel(ch)}
+                  aria-pressed={ch === selectedChannel}
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded border transition-colors ${
+                    ch === selectedChannel
+                      ? "bg-cyan-600 border-cyan-500 text-white font-bold"
+                      : "bg-gray-950 border-gray-800 text-gray-400 hover:text-gray-200"
+                  }`}
+                >
+                  {ch}
+                </button>
+              ))}
             </div>
           </div>
 
-          {dataset && (
-            <>
-              {/* Plot 1: Stacked Waveform Sweeps */}
-              <SignalExplorer
-                dataPoints={dataset.dataPoints}
-                channels={activeScenario.channels}
+          <SignalExplorer
+            recording={recording}
+            processed={processed}
+            selectedChannel={selectedChannel}
+            onSelectChannel={setSelectedChannel}
+            showRaw={showRaw}
+            onToggleRaw={setShowRaw}
+          />
+
+          <SpectralCharts
+            psd={psd ?? processed.psd[recording.channels[0]]}
+            bandPower={bandRow}
+            selectedChannel={selectedChannel}
+            displayLog={logScale}
+            onToggleLog={setLogScale}
+            fileStem={recording.name}
+          />
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+            <div className="lg:col-span-5">
+              <ScalpMap
+                bandPower={processed.bandPower}
+                selectedBand={selectedBand}
+                onSelectBand={setSelectedBand}
                 selectedChannel={selectedChannel}
                 onSelectChannel={setSelectedChannel}
-                showCleaned={showCleaned}
-                onToggleCleaned={setShowCleaned}
               />
-
-              {/* Plot 2: Spectral PSD Lines and Bar Ratios */}
-              <SpectralCharts bandPower={dataset.bandPower} selectedChannel={selectedChannel} />
-
-              {/* Plot 3: 10-20 Scalp Map and 2D Continuous Spectrogram side-by-side */}
-              <div className="grid grid-cols-1 md:grid-cols-12 gap-5" id="scalp-spectrogram-grid">
-                
-                {/* 10-20 Scalp Map Circle */}
-                <div className="md:col-span-5 h-full">
-                  <div className="flex flex-col gap-2 h-full justify-between">
-                    <ScalpMap bandPowers={dataset.bandPower} selectedBand={selectedBand} />
-                    {/* Band toggles specifically for Scalp Map circle */}
-                    <div className="flex justify-between gap-1 p-1 bg-gray-950 border border-gray-850 rounded-xl mt-1 overflow-x-auto text-[9px] font-mono">
-                      {(["delta", "theta", "alpha", "beta", "gamma"] as const).map((band) => (
-                        <button
-                          key={band}
-                          onClick={() => setSelectedBand(band)}
-                          className={`flex-1 text-center py-1 rounded font-bold capitalize select-none transition-all ${
-                            selectedBand === band
-                              ? "bg-cyan-600 text-white"
-                              : "text-gray-500 hover:text-gray-300"
-                          }`}
-                        >
-                          {band.substring(0, 3)}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
-
-                {/* 2D Spectrogram Canvas */}
-                <div className="md:col-span-7 h-full">
-                  <Spectrogram
-                    dataPoints={dataset.dataPoints}
-                    selectedChannel={selectedChannel}
-                    scenarioId={activeScenarioId}
-                  />
-                </div>
-              </div>
-
-              {/* Plot 4: ML Prediction Timeline (Macro Staging hypnogram) */}
-              <div className="bg-gray-900 border border-gray-800 p-5 rounded-2xl shadow-xl flex flex-col gap-3" id="prediction-timeline-card">
-                <div>
-                  <h4 className="text-sm font-semibold text-gray-200">Continuous Pipeline Predictions Staging</h4>
-                  <p className="text-xs text-gray-400 mt-0.5">Automated temporal indexing. Highlights macro hypnogram transitions over 20-seconds sweep.</p>
-                </div>
-
-                {/* Visual Horizontal Staging Blocks */}
-                <div className="h-6 rounded-lg w-full bg-gray-950 border border-gray-850 overflow-hidden flex text-[10px] font-mono relative select-none">
-                  {activeScenarioId === "sleep" ? (
-                    <>
-                      <div className="h-full bg-blue-900/60 border-r border-gray-800 flex items-center justify-center font-bold text-blue-200" style={{ width: "20%" }}>WAKE (0-4s)</div>
-                      <div className="h-full bg-indigo-900/50 border-r border-gray-800 flex items-center justify-center font-bold text-indigo-300" style={{ width: "20%" }}>N1 (4-8s)</div>
-                      <div className="h-full bg-purple-900/60 border-r border-gray-800 flex items-center justify-center font-bold text-purple-200" style={{ width: "20%" }}>N2 (8-12s)</div>
-                      <div className="h-full bg-violet-900/70 border-r border-gray-800 flex items-center justify-center font-bold text-violet-200" style={{ width: "20%" }}>N3 (12-16s)</div>
-                      <div className="h-full bg-pink-900/50 flex items-center justify-center font-bold text-pink-300" style={{ width: "20%" }}>REM (16-20s)</div>
-                    </>
-                  ) : activeScenarioId === "epilepsy" ? (
-                    <>
-                      <div className="h-full bg-emerald-950/60 border-r border-gray-800 flex items-center justify-center font-bold text-emerald-300" style={{ width: "30%" }}>Normal (0-6s)</div>
-                      <div className="h-full bg-amber-950/60 border-r border-gray-800 flex items-center justify-center font-bold text-amber-300" style={{ width: "30%" }}>Pre-seizure (6-12s)</div>
-                      <div className="h-full bg-red-950/80 border-r border-gray-800 flex items-center justify-center font-bold text-red-300" style={{ width: "30%" }}>Active Seizure (12-18s)</div>
-                      <div className="h-full bg-emerald-950/60 flex items-center justify-center font-bold text-emerald-300" style={{ width: "10%" }}>Post (18-20s)</div>
-                    </>
-                  ) : activeScenarioId === "workload" ? (
-                    <>
-                      <div className="h-full bg-blue-950/60 border-r border-gray-800 flex items-center justify-center font-bold text-blue-300" style={{ width: "30%" }}>Low Load (0-6s)</div>
-                      <div className="h-full bg-red-950/50 border-r border-gray-800 flex items-center justify-center font-bold text-red-300" style={{ width: "40%" }}>High Cognitive Load (6-14s)</div>
-                      <div className="h-full bg-amber-950/50 flex items-center justify-center font-bold text-amber-300" style={{ width: "30%" }}>Medium Load (14-20s)</div>
-                    </>
-                  ) : (
-                    <>
-                      <div className="h-full bg-red-950/40 border-r border-gray-800 flex items-center justify-center font-bold text-red-300" style={{ width: "25%" }}>Distracted (0-5s)</div>
-                      <div className="h-full bg-emerald-950/50 border-r border-gray-800 flex items-center justify-center font-bold text-emerald-300" style={{ width: "40%" }}>Focused Relaxed (5-13s)</div>
-                      <div className="h-full bg-indigo-950/60 flex items-center justify-center font-bold text-indigo-300" style={{ width: "35%" }}>Deep Zen State (13-20s)</div>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              {/* Plot 5: AI Diagnostic Consultative Copilot */}
-              <AICopilot
-                scenarioName={activeScenario.name}
-                activeLabel={currentLabel}
-                globalMetrics={dataset.globalMetrics}
-                bandPower={dataset.bandPower}
-                preprocessing={preprocessing}
-                artifacts={artifacts}
+            </div>
+            <div className="lg:col-span-7">
+              <Spectrogram
+                recording={recording}
+                processed={processed}
+                selectedChannel={selectedChannel}
               />
-            </>
-          )}
+            </div>
+          </div>
+
+          <PredictionTimeline
+            recording={recording}
+            classification={processed.classification}
+            epochSeconds={applied.features.epochSeconds}
+          />
+
+          <AICopilot recording={recording} processed={processed} config={applied} />
         </section>
       </main>
+
+      <footer className="border-t border-gray-800 px-5 py-3 text-[10px] font-mono text-gray-500 flex flex-wrap gap-x-4 gap-y-1 justify-between">
+        <span>
+          Signal processing runs in the browser. Recordings are synthetic unless you import a file.
+        </span>
+        <span>Not a medical device and not for clinical use.</span>
+      </footer>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Small presentational helpers
+// ---------------------------------------------------------------------------
+
+const inputClass =
+  "bg-gray-900 border border-gray-800 text-xs rounded px-1.5 py-1 w-full text-gray-200 focus:border-cyan-500 outline-none";
+
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="block">
+      <span className="text-[10px] text-gray-500 uppercase font-mono block mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Toggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-2 cursor-pointer text-gray-300">
+      <span className="text-xs">{label}</span>
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="accent-cyan-500 w-3.5 h-3.5"
+      />
+    </label>
+  );
+}
+
+function ExportButton({
+  onClick,
+  children,
+}: {
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="text-[11px] bg-gray-950 border border-gray-800 hover:border-cyan-700 hover:text-cyan-300 text-gray-300 rounded-lg px-2.5 py-2 transition-colors text-left"
+    >
+      {children}
+    </button>
+  );
+}
+
+const TONES: Record<string, string> = {
+  red: "bg-red-500/10 border-red-500/20 text-red-400",
+  blue: "bg-blue-500/10 border-blue-500/20 text-blue-400",
+  amber: "bg-amber-500/10 border-amber-500/20 text-amber-400",
+  cyan: "bg-cyan-500/10 border-cyan-500/20 text-cyan-400",
+  emerald: "bg-emerald-500/10 border-emerald-500/20 text-emerald-400",
+};
+
+function MetricTile({
+  icon,
+  tone,
+  label,
+  value,
+  unit,
+  hint,
+}: {
+  icon: React.ReactNode;
+  tone: keyof typeof TONES | string;
+  label: string;
+  value: string;
+  unit: string;
+  hint: string;
+}) {
+  return (
+    <div className="flex items-start gap-2.5 bg-gray-900/45 border border-gray-850 p-2.5 rounded-xl">
+      <div className={`p-2 rounded-lg border shrink-0 ${TONES[tone] ?? TONES.cyan}`}>{icon}</div>
+      <div className="min-w-0">
+        <span className="text-[10px] text-gray-500 font-mono block uppercase">{label}</span>
+        <span className="text-sm font-semibold text-gray-200 font-mono">
+          {value}{" "}
+          {unit && <span className="text-[10px] text-gray-400 font-normal">{unit}</span>}
+        </span>
+        <span className="text-[9px] text-gray-600 block truncate" title={hint}>
+          {hint}
+        </span>
+      </div>
     </div>
   );
 }

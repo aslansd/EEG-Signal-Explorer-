@@ -1,1 +1,62 @@
 @import "tailwindcss";
+
+/**
+ * Design tokens.
+ *
+ * `gray-850` was used in thirteen places but is not a Tailwind colour, so no rule
+ * was generated for it. Tailwind v4's reset sets `border: 0 solid` with no colour,
+ * which means those borders fell back to `currentColor` and rendered near-white
+ * on the dark panels. Defining the token here fixes every one of them.
+ */
+@theme {
+  --color-gray-850: oklch(0.244 0.034 260);
+  --animate-fade-in: fade-in 0.25s ease-out both;
+  --animate-pulse-soft: pulse-soft 2.4s ease-in-out infinite;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* Visible keyboard focus everywhere, which the original had nowhere. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--color-cyan-400);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* Respect the OS "reduce motion" setting instead of animating regardless. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* Dark scrollbars, so the notebook column does not get a light gutter. */
+  * {
+    scrollbar-color: var(--color-gray-700) transparent;
+    scrollbar-width: thin;
+  }
+}
