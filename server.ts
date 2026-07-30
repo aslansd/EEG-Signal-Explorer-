@@ -1,113 +1,228 @@
-import express from "express";
 import path from "path";
-import { createServer as createViteServer } from "vite";
+import express, { type Request, type Response } from "express";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
 
-// Parse JSON payloads
-app.use(express.json({ limit: "50mb" }));
+/**
+ * Cloud Run injects the port to listen on; hard-coding 3000 only worked because the
+ * service happened to be configured to match. Reading the environment first is what
+ * the platform expects.
+ */
+const PORT = Number(process.env.PORT) || 3000;
 
-// Initialize Gemini API Client server-side
+/**
+ * Development is opt-in via an explicit flag; production is the default.
+ *
+ * The original check was `NODE_ENV !== "production"`, which meant an unset
+ * variable in a deployed container silently started the Vite dev server in
+ * production. Inverting the default makes that failure mode impossible rather than
+ * merely unlikely, and a CLI flag works identically on Windows, macOS and Linux —
+ * `NODE_ENV=x npm start` does not.
+ */
+const IS_DEV =
+  process.argv.includes("--dev") || process.env.NODE_ENV === "development";
+
+/**
+ * The payload is now a compiled run record rather than the full recording, so the
+ * 50 MB limit that used to be here is far larger than anything legitimate. A tight
+ * limit is the cheapest defence against someone posting a huge body.
+ */
+app.use(express.json({ limit: "256kb" }));
+app.disable("x-powered-by");
+
+/**
+ * Tell Express it is behind a reverse proxy.
+ *
+ * Without this, `req.ip` is the address of the immediate TCP peer. On Cloud Run
+ * that peer is Google's front end, not the visitor — so every request in the world
+ * would land in the same rate-limit bucket, and one person refreshing quickly would
+ * lock out everybody else. With it, Express reads the client address from
+ * X-Forwarded-For.
+ *
+ * The trade-off: a client can prepend its own X-Forwarded-For value and rotate the
+ * apparent address to slip past the per-IP limit. That is why the daily cap below
+ * is counted globally rather than per address — it is the limit that actually
+ * bounds spend, and no header can affect it.
+ */
+app.set("trust proxy", true);
+
 const apiKey = process.env.GEMINI_API_KEY;
-let ai: GoogleGenAI | null = null;
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 
-if (apiKey) {
-  ai = new GoogleGenAI({
-    apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
+// ---------------------------------------------------------------------------
+// Rate limiting
+// ---------------------------------------------------------------------------
+
+/**
+ * The interpretation endpoint was previously open to the internet with no limit of
+ * any kind. Anyone who found the deployed URL could spend the project's Gemini
+ * quota in a loop. This is a small fixed-window limiter per client address — not a
+ * substitute for real auth, but it turns an open tap into a trickle.
+ */
+const WINDOW_MS = 60_000;
+const MAX_PER_WINDOW = 8;
+const MAX_PER_DAY = 200;
+const hits = new Map<string, { count: number; resetAt: number }>();
+let dailyCount = 0;
+let dailyResetAt = Date.now() + 86_400_000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of hits) if (entry.resetAt < now) hits.delete(key);
+}, WINDOW_MS).unref();
+
+function rateLimited(req: Request): string | null {
+  const now = Date.now();
+
+  if (now > dailyResetAt) {
+    dailyCount = 0;
+    dailyResetAt = now + 86_400_000;
+  }
+  if (dailyCount >= MAX_PER_DAY) {
+    return "This deployment has reached its daily interpretation budget. Try again tomorrow.";
+  }
+
+  const key = req.ip ?? "unknown";
+  if (key === "unknown") {
+    // Cannot attribute the request to a caller, so only the global cap applies.
+    return null;
+  }
+  const entry = hits.get(key);
+  if (!entry || entry.resetAt < now) {
+    hits.set(key, { count: 1, resetAt: now + WINDOW_MS });
+  } else {
+    entry.count += 1;
+    if (entry.count > MAX_PER_WINDOW) {
+      const wait = Math.ceil((entry.resetAt - now) / 1000);
+      return `Too many requests. Try again in ${wait}s.`;
+    }
+  }
+
+  dailyCount += 1;
+  return null;
 }
 
-// 1. API: Server health check
-app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", geminiConfigured: !!apiKey });
+// ---------------------------------------------------------------------------
+// API
+// ---------------------------------------------------------------------------
+
+app.get("/api/health", (_req: Request, res: Response) => {
+  // The client reads `model` so the badge in the UI cannot drift from what the
+  // server actually calls.
+  res.json({ status: "ok", geminiConfigured: !!apiKey, model: apiKey ? MODEL : null });
 });
 
-// 2. API: ML-Assisted EEG Clinical Interpretation
-app.post("/api/gemini/analyze", async (req, res) => {
-  try {
-    if (!ai) {
-      return res.status(500).json({
-        error: "Gemini API is not configured. Please add GEMINI_API_KEY to the secrets panel in Settings.",
-      });
-    }
+const SYSTEM_INSTRUCTION = `
+You are a clinical neurophysiologist and signal-processing engineer helping someone
+read the output of an EEG analysis tool.
 
-    const { scenarioName, activeState, bandPowers, globalMetrics, userPrompt, preprocessing, artifacts } = req.body;
+You will be given a run record: the pipeline settings that were used, the values
+measured from the signal, and the log of what each step did. Base your answer only
+on those numbers. If the record does not contain what would be needed to answer,
+say so rather than filling the gap.
 
-    const systemInstruction = `
-      You are an expert Clinical Neurophysiologist and AI/ML Brain-Computer Interface (BCI) Engineer.
-      Your goal is to interpret EEG signal summaries, spectral features, artifact statistics, and pipeline results.
-      Provide detailed, professional, and accessible clinical and engineering commentaries in clear Markdown format.
-      Always maintain clinical precision, explaining physiological relevance of bands (Delta, Theta, Alpha, Beta, Gamma) and artifact detection.
-    `;
+Recordings marked synthetic are generated by a simulator. For those, never write as
+though a patient exists, never offer a diagnosis, and never draft clinical
+correspondence. Discuss what the numbers show and what the pipeline did to produce
+them.
 
-    const prompt = `
-      Perform a professional interpretation of the current EEG recording:
-      - **EEG Recording Scenario**: ${scenarioName}
-      - **Current Segment State**: ${activeState}
-      - **Global Signal Metrics**:
-        * Est. Heart Rate: ${globalMetrics?.averageHeartRate || "N/A"} BPM
-        * Transient Blinks: ${globalMetrics?.blinkCount || 0} occurrences
-        * Noise Floor RMS: ${globalMetrics?.noiseLevel || 5} uV
-        * Artifact Interference Ratio: ${Math.round((globalMetrics?.overallArtifactRatio || 0) * 100)}%
-      - **Pipeline Configuration**:
-        * Preprocessing: Notch filter (${preprocessing?.notchFilter ? "ON" : "OFF"}), Bandpass (${preprocessing?.bandpassEnabled ? `${preprocessing?.bandpassMin}-${preprocessing?.bandpassMax} Hz` : "OFF"}), Re-referencing: ${preprocessing?.reReferencing}
-        * Artifact Cleaning: Method (${artifacts?.method}), Eye blinks (${artifacts?.detectEyeBlinks ? "ON" : "OFF"}), Muscle noise (${artifacts?.detectMuscle ? "ON" : "OFF"})
-      - **Electrode Spectral Band Powers (Average uV^2)**:
-        ${JSON.stringify(bandPowers, null, 2)}
+Write in clear Markdown. Prefer specific references to the values in the record over
+general description.
+`.trim();
 
-      ${userPrompt ? `**User Query / Area of Interest**: "${userPrompt}"` : "Please generate a comprehensive review of this signal segment, detailing the clinical indicators, the state of the brainwaves (frequency bands dominance), and the success/validity of the preprocessing and artifact filtering pipeline."}
-    `;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
-      contents: prompt,
-      config: {
-        systemInstruction,
-        temperature: 0.7,
-      },
+app.post("/api/interpret", async (req: Request, res: Response) => {
+  if (!ai) {
+    return res.status(503).json({
+      error: "No GEMINI_API_KEY is configured on the server, so interpretation is unavailable.",
     });
+  }
 
-    const reportText = response.text || "No report could be generated.";
-    res.json({ report: reportText });
-  } catch (error: any) {
-    console.error("Gemini analysis error:", error);
-    res.status(500).json({ error: error.message || "An error occurred during AI analysis." });
+  const limitMessage = rateLimited(req);
+  if (limitMessage) return res.status(429).json({ error: limitMessage });
+
+  const { userPrompt, runReport, isSynthetic } = req.body ?? {};
+
+  if (typeof runReport !== "string" || runReport.length < 20) {
+    return res.status(400).json({ error: "A run record is required." });
+  }
+  if (runReport.length > 40_000) {
+    return res.status(413).json({ error: "The run record is too large to send." });
+  }
+  if (userPrompt !== undefined && typeof userPrompt !== "string") {
+    return res.status(400).json({ error: "The question must be text." });
+  }
+
+  const question =
+    typeof userPrompt === "string" && userPrompt.trim()
+      ? userPrompt.trim().slice(0, 2000)
+      : "Summarise what this run shows and whether the pipeline settings were reasonable.";
+
+  const prompt = [
+    isSynthetic
+      ? "The recording below is SYNTHETIC, produced by a simulator. There is no patient."
+      : "The recording below was imported from a file.",
+    "",
+    "--- RUN RECORD ---",
+    runReport.slice(0, 40_000),
+    "--- END RUN RECORD ---",
+    "",
+    `Question: ${question}`,
+  ].join("\n");
+
+  try {
+    const response = await ai.models.generateContent({
+      model: MODEL,
+      contents: prompt,
+      config: { systemInstruction: SYSTEM_INSTRUCTION, temperature: 0.4 },
+    });
+    res.json({ report: response.text || "The model returned an empty response." });
+  } catch (error) {
+    // Log the detail server-side; return something safe to the client rather than
+    // forwarding a provider error message that may contain request internals.
+    console.error("Interpretation failed:", error);
+    res.status(502).json({ error: "The model request failed. Check the server logs for detail." });
   }
 });
 
-// Vite Middleware for Asset Pipeline / SPA Routing
-async function setupVite() {
-  if (process.env.NODE_ENV !== "production") {
-    console.log("Starting server in DEVELOPMENT mode with Vite middleware...");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    console.log("Starting server in PRODUCTION mode...");
+// ---------------------------------------------------------------------------
+// Static assets / dev middleware
+// ---------------------------------------------------------------------------
+
+async function start(): Promise<void> {
+  if (!IS_DEV) {
+    console.log("Starting in production mode");
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use(express.static(distPath, { maxAge: "1h", index: false }));
+    // Anything not matched above is the SPA entry point. API routes are registered
+    // earlier, so they are never swallowed by this.
+    app.get("*", (_req: Request, res: Response) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
+  } else {
+    console.log("Starting in development mode with Vite middleware");
+    /**
+     * Imported dynamically, not at module scope.
+     *
+     * The bundled production server previously required `vite` at load time even
+     * though it never used it, which meant the dev server had to be installed in
+     * the production image just to satisfy the import.
+     */
+    const { createServer } = await import("vite");
+    const vite = await createServer({ server: { middlewareMode: true }, appType: "spa" });
+    app.use(vite.middlewares);
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-setupVite().catch((err) => {
-  console.error("Failed to start server:", err);
+start().catch((error) => {
+  console.error("Failed to start:", error);
+  process.exit(1);
 });
